@@ -1,7 +1,9 @@
-"""Build guide locators for a biped: spine, arm, and leg chains.
+"""Build guides for a biped: spine, arm, and leg chains.
 
-Creates a "Guides" group with named locator hierarchies matching the repo
-naming convention ({side}_Name_BN). Positions are rough biped defaults in
+Creates a "Guides" group with named transform hierarchies matching the
+repo naming convention ({side}_Name_BN). A guide is a plain transform
+tagged with an `isGuide` attribute; its only shapes are the RGB axis
+arrows, so clicking an arrow selects the guide. Positions are rough biped defaults in
 centimeters.
 
 Library module: run through the Build Biped workflow tool (guides phase),
@@ -55,12 +57,50 @@ FOOT_PIVOT_GUIDES = [
 
 
 
+# The R_ guides are not placed by hand: they live under a group scaled -1
+# in X and have every transform connected straight from their L_ twin, so
+# the right side updates the instant a left guide is moved or rotated.
+MIRROR_GROUP = "Guides_Mirror"
+MIRROR_ATTRS = ("translate", "rotate", "scale")
+
+
+GUIDE_ATTR = "isGuide"
+
+
+def make_guide(name):
+    """A guide: bare transform tagged isGuide, arrows as its shapes."""
+    node = mc.createNode("transform", name=name, skipSelect=True)
+    tag_guide(node)
+    _add_axis_tripod(node)
+    return node
+
+
+def tag_guide(node):
+    if not mc.attributeQuery(GUIDE_ATTR, node=node, exists=True):
+        mc.addAttr(node, longName=GUIDE_ATTR, attributeType="bool",
+                   defaultValue=True)
+        mc.setAttr(node + "." + GUIDE_ATTR, lock=True)
+
+
+def is_guide(node):
+    """Guides are recognised by the isGuide tag (legacy: a locator shape)."""
+    if mc.attributeQuery(GUIDE_ATTR, node=node, exists=True):
+        return True
+    return bool(mc.listRelatives(node, shapes=True, type="locator"))
+
+
+def guides_under(top):
+    return [n for n in (mc.listRelatives(top, allDescendents=True,
+                                         type="transform",
+                                         fullPath=True) or [])
+            if is_guide(n)]
+
+
 def _build_chain(guides, parent_group, prefix="", mirror=False):
     previous = None
     top = None
     for name, pos in guides:
-        loc = mc.spaceLocator(n=prefix + name)[0]
-        _add_axis_tripod(loc)
+        loc = make_guide(prefix + name)
         x = -pos[0] if mirror else pos[0]
         mc.xform(loc, ws=True, t=(x, pos[1], pos[2]))
         if previous:
@@ -89,10 +129,98 @@ def build_guides(side="L"):
     made += ensure_foot_pivot_guides(side, top)
     orient_guides(top)
 
+    made += mirror_guides(top)[0]
     scene_meta.record("guides", nodes=[top], info={"side": side})
     mc.select(top)
     logger.debug("Built guides: %s", made)
     return made
+
+
+def _mirror_group(top="Guides"):
+    """The -1 scaleX group the driven R_ chains live under."""
+    if mc.objExists(MIRROR_GROUP):
+        return MIRROR_GROUP
+    grp = mc.createNode("transform", name=MIRROR_GROUP)
+    mc.setAttr(grp + ".scaleX", -1)
+    grp = mc.parent(grp, top, relative=True)[0]
+    for attr in ("tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz"):
+        mc.setAttr(grp + "." + attr, lock=True)
+    return grp
+
+
+def is_driven(loc):
+    """True for a guide whose placement comes from its mirror twin."""
+    return bool(mc.listConnections(loc + ".translate", source=True,
+                                   destination=False, plugs=True))
+
+
+def _free_transform(node):
+    """Unlock and disconnect a node's transform so it can be edited."""
+    for attr in MIRROR_ATTRS:
+        for axis in ("",) + tuple("XYZ"):
+            plug = "{}.{}{}".format(node, attr, axis)
+            mc.setAttr(plug, lock=False)
+        for src in mc.listConnections(node + "." + attr, source=True,
+                                      destination=False, plugs=True) or []:
+            mc.disconnectAttr(src, node + "." + attr)
+
+
+def _drive_mirror(src, dst):
+    """Wire dst's local transform to src's. The group's -1 scaleX turns the
+    identical local values into a true mirror across YZ, which also gives
+    the R_ joints mirrored BEHAVIOUR when the skeleton is built from them.
+    """
+    _free_transform(dst)
+    for attr in MIRROR_ATTRS:
+        if not mc.isConnected(src + "." + attr, dst + "." + attr):
+            mc.connectAttr(src + "." + attr, dst + "." + attr, force=True)
+        mc.setAttr(dst + "." + attr, lock=True)
+
+
+def mirror_guides(top="Guides"):
+    """Build (or adopt) the R_ guides and drive them from the L_ side.
+
+    Safe to re-run: missing R_ chains are created, R_ chains left loose by
+    an older build are moved under the mirror group, and every connection
+    is refreshed. Returns (made, linked).
+    """
+    grp = _mirror_group(top)
+    made = []
+
+    def adopt(name):
+        parent = (mc.listRelatives(name, parent=True, fullPath=True)
+                  or [None])[0]
+        if parent and parent.split("|")[-1] == MIRROR_GROUP:
+            return
+        # a locked or connected transform cannot be reparented, so free it
+        # first: this is the migration path for guides built before the
+        # mirror group existed
+        _free_transform(name)
+        mc.parent(name, grp)
+
+    for guides in (ARM_GUIDES, LEG_GUIDES):
+        root = "R_" + guides[0][0]
+        if mc.objExists(root):
+            adopt(root)
+        else:
+            made.append(_build_chain(guides, grp, prefix="R_"))
+    for name, pos in FOOT_PIVOT_GUIDES:
+        full = "R_" + name
+        if mc.objExists(full):
+            adopt(full)
+            continue
+        loc = make_guide(full)
+        mc.xform(loc, ws=True, t=pos)
+        made.append(mc.parent(loc, grp)[0])
+
+    linked = 0
+    for dst in guides_under(grp):
+        src = "L_" + dst.split("|")[-1][2:]
+        if mc.objExists(src):
+            _drive_mirror(src, dst)
+            linked += 1
+    logger.debug("mirror guides: %d built, %d driven", len(made), linked)
+    return made, linked
 
 
 AXIS_TRIPOD = (
@@ -102,7 +230,6 @@ AXIS_TRIPOD = (
 )
 
 
-AXIS_WIDTH = 3.0        # legacy curve lineWidth (fallback shapes only)
 AXIS_SHAFT = 0.045      # shaft radius as a fraction of axis length
 AXIS_HEAD = 0.28        # cone length as a fraction of axis length
 
@@ -121,40 +248,55 @@ def _axis_shader(rgb):
     return sg
 
 
-def _axis_arrow(name, vec, size, color, rgb):
-    """One solid axis arrow: cylinder shaft + cone tip, pointing down vec.
+AXIS_ATTR = "guideAxisLength"   # on TOOLSET_META: arrow length, live
+WIDTH_ATTR = "guideAxisWidth"   # on TOOLSET_META: shaft/head thickness, live
+LEN_MD = "guideAxisLen_MD"      # X shaft length, Y head length, Z head offset
+RAD_MD = "guideAxisRad_MD"      # X shaft radius, Y head radius, Z shaft offset
 
-    Real geometry rather than a line, so the axis reads from any angle and
-    at any zoom. Returns the arrow's transform (caller shape-parents it).
-    """
-    shaft_len = size * (1.0 - AXIS_HEAD)
-    head_len = size * AXIS_HEAD
-    radius = size * AXIS_SHAFT
 
-    shaft = mc.polyCylinder(name=name + "_shaft", radius=radius,
-                            height=shaft_len, subdivisionsAxis=12,
-                            subdivisionsHeight=1, subdivisionsCaps=0,
-                            constructionHistory=False)[0]
-    # polyCylinder/polyCone build along +Y: move up by half, then aim
-    mc.move(0, shaft_len * 0.5, 0, shaft, absolute=True)
-    head = mc.polyCone(name=name + "_head", radius=radius * 2.6,
-                       height=head_len, subdivisionsAxis=12,
-                       subdivisionsHeight=1, subdivisionsCap=0,
-                       constructionHistory=False)[0]
-    mc.move(0, shaft_len + head_len * 0.5, 0, head, absolute=True)
+def _meta_float(attr, default):
+    n = scene_meta.node()
+    if not mc.attributeQuery(attr, node=n, exists=True):
+        mc.addAttr(n, longName=attr, attributeType="double",
+                   minValue=0.01, defaultValue=default, keyable=True)
+    return n + "." + attr
 
-    arrow = mc.polyUnite(shaft, head, name=name,
-                         constructionHistory=False)[0]
-    mc.delete(arrow, constructionHistory=True)
-    mc.xform(arrow, pivots=(0, 0, 0))
-    # rotate +Y onto the requested axis
-    if vec == (1, 0, 0):
-        mc.rotate(0, 0, -90, arrow, absolute=True)
-    elif vec == (0, 0, 1):
-        mc.rotate(90, 0, 0, arrow, absolute=True)
-    mc.makeIdentity(arrow, apply=True, translate=True, rotate=True,
-                    scale=True)
-    shape = mc.listRelatives(arrow, shapes=True, fullPath=True)[0]
+
+def axis_size_plug():
+    """Scene-wide arrow LENGTH. Every guide's arrows follow it live,
+    no rebuild. Set from Build Biped or the channel box on TOOLSET_META."""
+    return _meta_float(AXIS_ATTR, 3.0)
+
+
+def axis_width_plug():
+    """Scene-wide arrow THICKNESS, independent of length."""
+    return _meta_float(WIDTH_ATTR, 3.0)
+
+
+def _axis_math():
+    """Two shared multiplyDivide nodes turn length/width into every
+    dimension the arrow history nodes need. Created once per scene."""
+    if not mc.objExists(LEN_MD):
+        ln = mc.createNode("multiplyDivide", name=LEN_MD, skipSelect=True)
+        length = axis_size_plug()
+        for ch in "XYZ":
+            mc.connectAttr(length, "{}.input1{}".format(ln, ch))
+        mc.setAttr(ln + ".input2X", 1.0 - AXIS_HEAD)
+        mc.setAttr(ln + ".input2Y", AXIS_HEAD)
+        mc.setAttr(ln + ".input2Z", 1.0 - AXIS_HEAD * 0.5)
+    if not mc.objExists(RAD_MD):
+        rd = mc.createNode("multiplyDivide", name=RAD_MD, skipSelect=True)
+        width = axis_width_plug()
+        mc.connectAttr(width, rd + ".input1X")
+        mc.connectAttr(width, rd + ".input1Y")
+        mc.connectAttr(axis_size_plug(), rd + ".input1Z")
+        mc.setAttr(rd + ".input2X", AXIS_SHAFT)
+        mc.setAttr(rd + ".input2Y", AXIS_SHAFT * 2.6)
+        mc.setAttr(rd + ".input2Z", (1.0 - AXIS_HEAD) * 0.5)
+    return LEN_MD, RAD_MD
+
+
+def _style_shape(shape, color, rgb):
     # Wireframe color from the index override; SHADED color needs a real
     # shader (display overrides leave a shaded mesh grey). surfaceShader is
     # unlit, so the axis reads as a pure flat color in any lighting.
@@ -165,51 +307,63 @@ def _axis_arrow(name, vec, size, color, rgb):
     mc.setAttr(shape + ".castsShadows", 0)
     mc.setAttr(shape + ".receiveShadows", 0)
     mc.sets(shape, edit=True, forceElement=_axis_shader(rgb))
-    return arrow
 
 
-def _add_axis_tripod(loc, size=3.0, width=AXIS_WIDTH):
-    """RGB axis arrows parented as SHAPES under the guide transform, so the
-    guide's orientation is readable at a glance without extra nodes."""
+def _live_piece(guide, name, vec, primitive, len_plug, off_plug, rad_plug,
+                color, rgb):
+    """One arrow piece (shaft or head) as a shape ON the guide, with its
+    poly history kept and driven: primitive size from the meta attrs, a
+    polyMoveVertex sliding it out along the axis so the base sits at the
+    guide. Returns the shape."""
+    kwargs = dict(name=name, axis=vec, subdivisionsAxis=12,
+                  subdivisionsHeight=1, constructionHistory=True)
+    if primitive == "cylinder":
+        xform, hist = mc.polyCylinder(subdivisionsCaps=0, **kwargs)
+    else:
+        xform, hist = mc.polyCone(subdivisionsCap=0, **kwargs)
+    mc.connectAttr(len_plug, hist + ".height")
+    mc.connectAttr(rad_plug, hist + ".radius")
+    mv = mc.polyMoveVertex(xform, constructionHistory=True)[0]
+    along = "XYZ"[list(vec).index(1)]
+    mc.connectAttr(off_plug, "{}.translate{}".format(mv, along))
+    shape = mc.listRelatives(xform, shapes=True, fullPath=True)[0]
+    shape = mc.rename(shape, name + "Shape")
+    _style_shape(shape, color, rgb)
+    mc.parent(shape, guide, relative=True, shape=True)
+    mc.delete(xform)
+    return "{}|{}Shape".format(guide, name)
+
+
+def _add_axis_tripod(loc, size=None, width=None):
+    """RGB axis arrows as SHAPES on the guide transform: clicking an arrow
+    selects the guide. Each arrow is a shaft cylinder + head cone whose
+    poly history stays live and is driven from TOOLSET_META, so length
+    and thickness change scene-wide without a rebuild."""
+    short = loc.split("|")[-1]
+    if mc.objExists("{}_axisXShape".format(short)):
+        return
+    ln, rd = _axis_math()
     for label, vec, color, rgb in AXIS_TRIPOD:
-        arrow = _axis_arrow("{}_axis{}".format(loc, label), vec, size,
-                            color, rgb)
-        shape = mc.listRelatives(arrow, shapes=True, fullPath=True)[0]
-        shape = mc.rename(shape, "{}_axis{}Shape".format(loc, label))
-        mc.parent(shape, loc, relative=True, shape=True)
-        mc.delete(arrow)
+        base = "{}_axis{}".format(short, label)
+        _live_piece(loc, base, vec, "cylinder",
+                    ln + ".outputX", rd + ".outputZ", rd + ".outputX",
+                    color, rgb)
+        _live_piece(loc, base + "Head", vec, "cone",
+                    ln + ".outputY", ln + ".outputZ", rd + ".outputY",
+                    color, rgb)
+    if size is not None:
+        mc.setAttr(axis_size_plug(), float(size))
+    if width is not None:
+        mc.setAttr(axis_width_plug(), float(width))
 
 
-def set_axis_size(size=3.0, width=AXIS_WIDTH, top="Guides"):
-    """Resize every guide's axis arrows in place.
-
-    Mesh arrows are rebuilt at the new size rather than scaled, so the
-    guide transform stays at scale 1 (nothing downstream inherits a
-    factor) and cone tips keep their proportions. The locator crosshair
-    is matched to the same size.
-    """
-    changed = 0
-    for loc in mc.listRelatives(top, allDescendents=True, type="transform",
-                                fullPath=True) or []:
-        shapes = mc.listRelatives(loc, shapes=True, fullPath=True) or []
-        if not any(mc.nodeType(sh) == "locator" for sh in shapes):
-            continue
-        short = loc.split("|")[-1]
-        for shape in shapes:
-            sh_short = shape.split("|")[-1]
-            if mc.nodeType(shape) == "locator":
-                # the crosshair is redundant now that solid arrows show the
-                # frame, but the locator shape is how every tool RECOGNISES
-                # a guide (listRelatives type="locator"), so keep it as a
-                # tiny selectable nub rather than deleting it
-                for axis in "XYZ":
-                    mc.setAttr("{}.localScale{}".format(shape, axis),
-                               size * 0.04)
-            elif "_axis" in sh_short:
-                mc.delete(shape)
-                changed += 1
-        _add_axis_tripod(short, size, width)
-    return changed
+def set_axis_size(size=3.0, width=None, top="Guides"):
+    """Set the scene-wide arrow length (and optionally thickness). Every
+    tripod follows live."""
+    mc.setAttr(axis_size_plug(), float(size))
+    if width is not None:
+        mc.setAttr(axis_width_plug(), float(width))
+    return size
 
 
 def _aim_guide(loc, target_pos):
@@ -243,10 +397,12 @@ def orient_guides(top="Guides"):
     if not mc.objExists(top):
         return 0
     all_locs = []
-    for loc in mc.listRelatives(top, allDescendents=True, type="transform",
-                                fullPath=True) or []:
-        if mc.listRelatives(loc, shapes=True, type="locator"):
-            all_locs.append(loc)
+    for loc in guides_under(top):
+        # driven mirrors take their frame from the twin: aiming them here
+        # would just fail on the locked, connected transforms
+        if is_driven(loc):
+            continue
+        all_locs.append(loc)
     all_locs.sort(key=lambda n: n.count("|"))          # parents first
     snapshot = {loc: mc.xform(loc, q=True, ws=True, t=True)
                 for loc in all_locs}
@@ -255,7 +411,7 @@ def orient_guides(top="Guides"):
         return [c for c in (mc.listRelatives(loc, children=True,
                                              type="transform",
                                              fullPath=True) or [])
-                if mc.listRelatives(c, shapes=True, type="locator")]
+                if is_guide(c)]
 
     count = 0
     for loc in all_locs:
@@ -280,18 +436,27 @@ def orient_guides(top="Guides"):
     return count
 
 
-def upgrade_guide_display(top="Guides", size=3.0, width=AXIS_WIDTH):
-    """Retrofit axis tripods onto guides that lack them, size them all to
-    `size`, then orient everything."""
+def upgrade_guide_display(top="Guides", size=3.0, width=None):
+    """Retrofit guides to the current display: tag them, drop legacy
+    locator shapes and old arrow layouts, rebuild live arrows, set the
+    scene-wide size, then orient everything."""
     added = 0
-    for loc in mc.listRelatives(top, allDescendents=True, type="transform",
-                                fullPath=True) or []:
-        if not mc.listRelatives(loc, shapes=True, type="locator"):
-            continue
+    for loc in guides_under(top):
         short = loc.split("|")[-1]
-        if mc.ls("{}_axisXShape".format(short)):
+        tag_guide(loc)
+        if mc.objExists("{}_axisXHeadShape".format(short)):
             continue
-        _add_axis_tripod(short, size, width)
+        # legacy: locator crosshair, baked arrow shapes, or per-arrow
+        # scaled children. Clear them all and rebuild as live shapes.
+        for shape in mc.listRelatives(loc, shapes=True, fullPath=True) or []:
+            sh = shape.split("|")[-1]
+            if mc.nodeType(shape) == "locator" or "_axis" in sh:
+                mc.delete(shape)
+        for child in mc.listRelatives(loc, children=True, type="transform",
+                                      fullPath=True) or []:
+            if child.split("|")[-1].startswith(short + "_axes"):
+                mc.delete(child)
+        _add_axis_tripod(loc)
         added += 1
     set_axis_size(size, width, top)
     oriented = orient_guides(top)
@@ -337,8 +502,7 @@ def ensure_foot_pivot_guides(side="L", top="Guides"):
         full = prefix + name
         if mc.objExists(full):
             continue
-        loc = mc.spaceLocator(n=full)[0]
-        _add_axis_tripod(loc)
+        loc = make_guide(full)
         x = -pos[0] if mirror else pos[0]
         mc.xform(loc, ws=True, t=(x, pos[1], pos[2]))
         loc = mc.parent(loc, top)[0]
